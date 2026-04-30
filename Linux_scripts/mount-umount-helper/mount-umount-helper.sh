@@ -181,7 +181,7 @@
 #
 # Intended Usage:
 #
-#   - Companion teardown tool for mount-helper.sh
+#   - Companion teardown tool for mount-helper
 #   - Rescue VM cleanup after disk inspection or repair
 #   - Cloud VM recovery workflows (Azure and similar)
 #
