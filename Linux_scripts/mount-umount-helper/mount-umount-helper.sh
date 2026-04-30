@@ -1,5 +1,193 @@
 #!/usr/bin/env bash
 
+#===============================================================================
+# mount-helper
+#
+# Purpose:
+#   Safely mount a problem VM OS disk onto a rescue VM for inspection,
+#   repair, or recovery. This script supports both LVM and non-LVM disks
+#   and records all actions in a state file so they can be cleanly
+#   reversed by umount-helper.sh.
+#
+# High-Level Workflow:
+#
+#   START
+#     ├─ Initialize logging and state tracking
+#     ├─ Detect rescue VM OS and disk layout (LVM / Non-LVM)
+#     ├─ Validate root privileges
+#     ├─ Select and validate mountpoint
+#     ├─ Select and validate problem VM disk
+#     ├─ Detect disk type and UUID relationships
+#     ├─ Select mount method based on OS + disk combination
+#     ├─ Execute mount strategy
+#     ├─ Perform OS-specific post-mount fixes (RHEL 9+)
+#     └─ EXIT with full rollback metadata recorded
+#
+# Mount Method Selection Logic:
+#
+#   Rescue OS   | User Disk   | Method | Description
+#   ------------+-------------+--------+-------------------------------
+#   Non-LVM     | Non-LVM     | 1      | Simple partition mount
+#   LVM         | Non-LVM     | 4      | Simple partition mount
+#   Non-LVM     | LVM         | 3      | Direct LVM activation
+#   LVM         | LVM         | 2      | LVM clone (vgimportclone)
+#
+# Mount Method Behavior Summary:
+#
+#   Method 1 / 4:
+#     - Detect partitions heuristically
+#     - Mount root, /boot, /boot/efi
+#     - Use XFS nouuid when needed
+#
+#   Method 2 (vgimportclone):
+#     - Detect PVs on user disk
+#     - Record ORIGINAL_VG in state file
+#     - Detect VG name collisions
+#     - Import VG under a new name
+#     - Activate LVs and mount filesystems
+#     - Always mount XFS with -o nouuid
+#
+#   Method 3:
+#     - vgscan + vgchange -ay
+#     - Mount /dev/mapper logical volumes directly
+#
+# Common Post-Mount Steps:
+#   - Mount helper filesystems:
+#       /proc, /sys, /dev, /run
+#   - Record every mount action in STATEFILE
+#
+# RHEL 9+ Special Handling:
+#   - Normalize /etc/fstab entries to UUID=
+#   - Update boot loader entries (root=UUID=)
+#   - Backup original files before modification
+#
+# Safety Guarantees:
+#   - Script aborts on invalid input or unsafe conditions
+#   - No mounts occur over non-empty or active directories
+#   - UUID and VG collisions are explicitly handled
+#   - All actions are logged and recorded for reversal
+#
+# Rollback:
+#   - STATEFILE contains complete metadata of:
+#       * mount order
+#       * devices and mountpoints
+#       * VG renames and imports
+#       * dmsetup snapshots
+#       * OS metadata
+#   - umount-helper.sh consumes this file to safely undo changes
+#
+# Intended Usage:
+#   - Rescue / recovery environments
+#   - VM disk inspection and repair workflows
+#   - Cloud rescue scenarios (Azure / similar)
+#
+#===============================================================================
+
+#===============================================================================
+# umount-helper
+#
+# Purpose:
+#   Safely reverse and clean up all mount operations performed by
+#   mount-helper. This script uses the state file generated during
+#   the mount phase as the authoritative source of truth to ensure
+#   correct unmount order, LVM cleanup, and disk detachment.
+#
+# High-Level Workflow:
+#
+#   START
+#     ├─ Validate input state file
+#     ├─ Initialize logging (with safe fallback)
+#     ├─ Reconstruct mount context from STATEFILE
+#     ├─ Detect mount method used during mount phase
+#     ├─ Display consolidated state context to operator
+#     ├─ Discover active mountpoints related to the user disk
+#     ├─ Validate live mounts against recorded state
+#     ├─ Perform safe, ordered unmount (children first)
+#     ├─ Handle LVM-specific cleanup (if applicable)
+#     ├─ Detach user disk from kernel (with confirmation)
+#     └─ EXIT cleanly or with explicit operator guidance
+#
+# State-Driven Design:
+#
+#   umount-helper does NOT infer or guess mount state.
+#   All teardown decisions are based on data recorded by
+#   mount-helper in the STATEFILE, including:
+#
+#     - Mount method used (1–4)
+#     - Mountpoint path
+#     - User-selected disk
+#     - Original and imported VG names
+#     - PV → VG mappings
+#     - OS version and safety policies
+#     - Device-mapper snapshots (when applicable)
+#
+# Mount Method Awareness:
+#
+#   Method | Mount Phase Behavior             | Umount Phase Handling
+#   -------+----------------------------------+------------------------------
+#     1    | Non-LVM OS + Non-LVM disk        | Simple unmount only
+#     2    | LVM clone (vgimportclone)        | Strict PV/VG verification,
+#          |                                  | UUID normalization (RHEL 9),
+#          |                                  | controlled LVM teardown
+#     3    | Non-LVM OS + LVM disk            | vgchange cleanup + dmsetup
+#     4    | LVM OS + Non-LVM disk            | Simple unmount only
+#
+# Unmount Strategy:
+#
+#   - Discover all mountpoints created under the mountpoint
+#     (e.g. /rescue) using the STATEFILE
+#   - Filter only currently mounted targets
+#   - Sort by path depth (deepest first)
+#   - Attempt normal unmount, escalate to lazy/force if required
+#   - Retry failed unmounts after parent release
+#   - Abort safely if unexpected mounts remain
+#
+# LVM Safety Checks (Method 2):
+#
+#   - Verify PV → VG mappings match recorded state
+#   - Detect unexpected VG changes
+#   - Enforce strict abort rules unless OS policy allows exception
+#   - Prevent disk detach if live mounts do not match state
+#
+# OS-Specific Safety Policies:
+#
+#   - RHEL 8.10+, RHEL 9+, RHEL 10+:
+#       * Skip live vgrename operations
+#       * Avoid device-mapper remapping risks
+#
+#   - RHEL 9 + Method 2:
+#       * Optional UUID normalization for:
+#           - /etc/fstab
+#           - boot loader entries
+#       * Backup files before modification
+#       * Require explicit user confirmation
+#
+# Disk Detachment:
+#
+#   - User disk is detached from the kernel ONLY after:
+#       * All recorded mounts are unmounted
+#       * Live mount state matches STATEFILE
+#       * Operator explicitly confirms the action
+#
+#   - Kernel-level detach is performed via:
+#       /sys/block/<device>/device/delete
+#
+# Safety Guarantees:
+#
+#   - No unmount or detach occurs without operator confirmation
+#   - Unexpected live mounts cause a hard abort
+#   - STATEFILE remains the single source of truth
+#   - Errors are explicit and actionable
+#
+# Intended Usage:
+#
+#   - Companion teardown tool for mount-helper.sh
+#   - Rescue VM cleanup after disk inspection or repair
+#   - Cloud VM recovery workflows (Azure and similar)
+#
+#===============================================================================
+
+
 set -euo pipefail
 
 # ---------------------------------------------------
