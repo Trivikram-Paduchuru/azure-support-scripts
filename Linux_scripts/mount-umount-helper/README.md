@@ -72,7 +72,9 @@ The script includes special handling for platform-specific behaviors:
 
 ## ⚡ Quick Start
 
+- Download and execute
 ```bash
+wget https://github.com/Trivikram-Paduchuru/azure-support-scripts/blob/master/Linux_scripts/mount-umount-helper/mount-umount-helper.sh
 chmod +x mount-umount-helper.sh
 sudo ./mount-umount-helper.sh
 ```
