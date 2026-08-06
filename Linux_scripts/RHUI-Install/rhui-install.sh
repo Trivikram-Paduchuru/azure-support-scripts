@@ -2,6 +2,8 @@
 
 set -euo pipefail
 
+METADATA_URL="http://169.254.169.254/metadata/instance/compute?api-version=2021-02-01"
+HEADER="Metadata:true"
 RHUI_HOST="rhui4-1.microsoft.com"
 
 #--------------------------------------------------
@@ -34,6 +36,77 @@ repo_query() {
     else
         repoquery --config "$1" --qf "$2" "$3" 2>/dev/null || true
     fi
+}
+
+#--------------------------------------------------
+# Helper: RHUI Installation Failure Guidance
+#--------------------------------------------------
+show_rhui_failure_guidance() {
+    local article_url="https://learn.microsoft.com/en-us/troubleshoot/azure/virtual-machines/linux/linux-rhui-connectivity-issues"
+    local validation_script_url="https://raw.githubusercontent.com/Azure/azure-support-scripts/refs/heads/master/Linux_scripts/rhui-check/rhui-check.py"
+
+    echo    
+    warn "Review the Microsoft RHUI connectivity troubleshooting steps:"
+    echo "$article_url"
+    echo
+    warn "Recommended: Run the RHUI validation script for RHEL $OS_VERSION."
+
+    case "$OS_VERSION" in
+        7)
+            echo "curl -sL $validation_script_url | sudo python2 -"
+            ;;
+        8|9|10)
+            echo "curl -sL $validation_script_url | sudo python3 -"
+            echo
+            info "If python3 is unavailable, use:"
+            echo "curl -sL $validation_script_url | sudo /usr/libexec/platform-python -"
+            ;;
+        *)
+            warn "No OS-specific validation command is documented for RHEL $OS_VERSION."
+            info "Follow the Microsoft article for currently supported versions."
+            ;;
+    esac
+
+    echo
+    info "After running the Microsoft rhui-check.py command above,"
+    info "its diagnostic results are saved to /var/log/rhuicheck.log."
+    info "This validation script is intended for RHEL Marketplace PAYG images."
+    info "For custom images, its results may not cover every configuration issue."    
+}
+
+#--------------------------------------------------
+# Helper: Custom Image Type Selection
+#--------------------------------------------------
+select_custom_image_type() {
+    echo "Available Image Types"
+    echo
+    echo "1) Standard"
+    echo "2) SAP Apps"
+    echo "3) SAP HA"
+    echo "4) HA"
+    echo
+
+    read -rp "Enter choice [1-4]: " IMAGE_CHOICE
+
+    case "$IMAGE_CHOICE" in
+        1)
+            IMAGE_SUFFIX="standard"
+            ;;
+        2)
+            IMAGE_SUFFIX="sapapps"
+            ;;
+        3)
+            IMAGE_SUFFIX="sap-ha"
+            ;;
+        4)
+            IMAGE_SUFFIX="ha"
+            ;;
+        *)
+            fail "Invalid image type selection"
+            ;;
+    esac
+
+    ok "Selected Image Type : $IMAGE_SUFFIX"
 }
 
 #--------------------------------------------------
@@ -82,9 +155,39 @@ fi
 
 ok "RHUI not present"
 
+METADATA=$(curl -s -H "$HEADER" "$METADATA_URL") || fail "Metadata fetch failed"
+
+OFFER=$(echo "$METADATA" | grep -oP '"offer":\s*"\K[^"]*' | head -1 || true)
+SKU=$(echo "$METADATA" | grep -oP '"sku":\s*"\K[^"]*' | head -1 || true)
+IMAGE_REFERENCE_ID=$(echo "$METADATA" |
+    grep -oP '"imageReference"\s*:\s*\{[^}]*\}' |
+    grep -oP '"id"\s*:\s*"\K[^"]*' |
+    head -1 || true)
+
 #--------------------------------------------------
-# 3. Billing Model Selection
+# 3. Detect Image Type
 #--------------------------------------------------
+section "Detecting Image Type"
+
+if [[ -n "$OFFER" && -n "$SKU" && -z "$IMAGE_REFERENCE_ID" ]]; then
+    OS_CREATED_FROM="Platform Image"
+    IMAGE_CLASSIFICATION="Marketplace image"
+else
+    OS_CREATED_FROM=${IMAGE_REFERENCE_ID:-"Non-Platform Image"}
+    IMAGE_CLASSIFICATION="Custom image"
+fi
+
+ok "OS created from      : $OS_CREATED_FROM"
+ok "Image classification : $IMAGE_CLASSIFICATION"
+
+#--------------------------------------------------
+# 4. Azure Metadata
+#--------------------------------------------------
+section "Azure Metadata"
+
+info "Offer : ${OFFER:-<empty>}"
+info "SKU   : ${SKU:-<empty>}"
+
 section "Select Billing Model"
 
 echo "Available Billing Models"
@@ -109,12 +212,7 @@ esac
 
 ok "Billing Model : $BILLING_MODEL"
 
-#--------------------------------------------------
-# BYOS Validation
-#--------------------------------------------------
-
 if [[ "$BILLING_MODEL" == "BYOS" ]]; then
-
     echo
     line
 
@@ -131,44 +229,114 @@ if [[ "$BILLING_MODEL" == "BYOS" ]]; then
 
     line
     echo
-
     exit 0
 fi
 
-#--------------------------------------------------
-# 4. Select Image Type
-#--------------------------------------------------
-section "Select Image Type"
+if [[ "$IMAGE_CLASSIFICATION" == "Custom image" ]]; then
 
-echo "Available Image Types"
-echo
-echo "1) Standard"
-echo "2) SAP Apps"
-echo "3) SAP HA"
-echo "4) HA"
-echo
+    section "Select Image Type"
 
-read -rp "Enter choice [1-4]: " IMAGE_CHOICE
+    
+    warn "Custom image detected. Select the correct image type."
+    warn "This choice determines which RHUI repositories and packages are installed."
+    warn "An incorrect selection may cause repository or package compatibility issues."    
+    echo
 
-case "$IMAGE_CHOICE" in
-    1)
-        IMAGE_SUFFIX="standard"
-        ;;
-    2)
+    select_custom_image_type
+
+    section "Validating Selected Image Type"
+
+    INSTALLED_PACKAGE_NAMES=$(rpm -qa --qf '%{NAME}\n' 2>/dev/null) || fail "Unable to query installed packages"
+    SAP_PACKAGES=""
+    HA_PACKAGES=""
+
+    while IFS= read -r PACKAGE_NAME; do
+        case "$PACKAGE_NAME" in
+            sapconf|sapconf-*|tuned-profiles-sap|tuned-profiles-sap-*|compat-sap|compat-sap-*|resource-agents-sap|resource-agents-sap-*|rhel-system-roles-sap|rhel-system-roles-sap-*)
+                SAP_PACKAGES+="${SAP_PACKAGES:+$'\n'}$PACKAGE_NAME"
+                ;;
+        esac
+
+        case "$PACKAGE_NAME" in
+            pacemaker|pacemaker-*|pcs|pcs-*|corosync|corosync-*|fence-agents|fence-agents-*)
+                HA_PACKAGES+="${HA_PACKAGES:+$'\n'}$PACKAGE_NAME"
+                ;;
+        esac
+    done <<< "$INSTALLED_PACKAGE_NAMES"
+
+    RECOMMENDED_IMAGE_SUFFIX=""
+    RECOMMENDED_IMAGE_TYPE=""
+
+    if [[ -n "$SAP_PACKAGES" && -n "$HA_PACKAGES" ]]; then
+        RECOMMENDED_IMAGE_SUFFIX="sap-ha"
+        RECOMMENDED_IMAGE_TYPE="SAP HA"
+    elif [[ -n "$SAP_PACKAGES" ]]; then
+        RECOMMENDED_IMAGE_SUFFIX="sapapps"
+        RECOMMENDED_IMAGE_TYPE="SAP Apps"
+    elif [[ -n "$HA_PACKAGES" ]]; then
+        RECOMMENDED_IMAGE_SUFFIX="ha"
+        RECOMMENDED_IMAGE_TYPE="HA"
+    fi
+
+    while [[ -n "$RECOMMENDED_IMAGE_SUFFIX" && "$IMAGE_SUFFIX" != "$RECOMMENDED_IMAGE_SUFFIX" ]]; do
+        echo        
+        warn "The selected image type does not match the installed workload packages."
+        warn "Selected image type    : $IMAGE_SUFFIX"
+        warn "Recommended image type : $RECOMMENDED_IMAGE_TYPE"
+
+        if [[ -n "$SAP_PACKAGES" ]]; then
+            echo
+            echo "Detected SAP-related packages:"
+            echo "$SAP_PACKAGES"
+        fi
+
+        if [[ -n "$HA_PACKAGES" ]]; then
+            echo
+            echo "Detected HA-related packages:"
+            echo "$HA_PACKAGES"
+        fi
+
+        echo
+        warn "Selecting an incompatible image type may install incorrect RHUI repositories."        
+        echo
+
+        read -rp "Re-select the image type? [Y/c to continue anyway]: " VALIDATION_CHOICE
+
+        case "$VALIDATION_CHOICE" in
+            ""|[Yy])
+                select_custom_image_type
+                ;;
+            [Cc])
+                warn "Continuing with explicitly selected image type: $IMAGE_SUFFIX"
+                break
+                ;;
+            *)
+                warn "Enter Y to re-select or C to continue with the current selection."
+                ;;
+        esac
+    done
+
+    if [[ -z "$RECOMMENDED_IMAGE_SUFFIX" ]]; then
+        info "No installed SAP or HA workload packages were detected."
+    elif [[ "$IMAGE_SUFFIX" == "$RECOMMENDED_IMAGE_SUFFIX" ]]; then
+        ok "Selected image type matches the installed workload packages"
+    fi
+else
+    SKU_LOWER=$(echo "$SKU" | tr '[:upper:]' '[:lower:]')
+    IMAGE_SUFFIX="standard"
+
+    if echo "$SKU_LOWER" | grep -q "sapapps"; then
         IMAGE_SUFFIX="sapapps"
-        ;;
-    3)
+    elif echo "$SKU_LOWER" | grep -q "sap" && echo "$SKU_LOWER" | grep -q "ha"; then
         IMAGE_SUFFIX="sap-ha"
-        ;;
-    4)
+    elif echo "$SKU_LOWER" | grep -q "sap"; then
+        IMAGE_SUFFIX="sap"
+    elif echo "$SKU_LOWER" | grep -q "ha"; then
         IMAGE_SUFFIX="ha"
-        ;;
-    *)
-        fail "Invalid image type selection"
-        ;;
-esac
+    fi
 
-ok "Selected Image Type : $IMAGE_SUFFIX"
+    ok "Detected Image Type : $IMAGE_SUFFIX"
+fi
 
 #--------------------------------------------------
 # Unsupported SAP / HA Minor Version Validation
@@ -307,20 +475,22 @@ else
 fi
 
 #--------------------------------------------------
-# Installation Confirmation
+# Installation Confirmation for Custom Images
 #--------------------------------------------------
-section "Installation Summary"
+if [[ "$IMAGE_CLASSIFICATION" == "Custom image" ]]; then
+    section "Installation Summary"
 
-echo "Billing Model : $BILLING_MODEL"
-echo "Image Type    : $IMAGE_SUFFIX"
-echo "OS Version    : $OS_VERSION.$OS_MINOR"
-echo
+    echo "Billing Model : $BILLING_MODEL"
+    echo "Image Type    : $IMAGE_SUFFIX"
+    echo "OS Version    : $OS_VERSION.$OS_MINOR"
+    echo
 
-read -rp "Continue with RHUI installation? [y/N]: " CONFIRM
+    read -rp "Continue with RHUI installation? [y/N]: " CONFIRM
 
-if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-    info "Installation cancelled by user"
-    exit 0
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        info "Installation cancelled by user"
+        exit 0
+    fi
 fi
 
 #--------------------------------------------------
@@ -418,6 +588,7 @@ if ! $PM --config "$CONFIG_FILE" install -y "$PKG" >"$TMP_LOG" 2>&1; then
     echo "------ ERROR DETAILS ------"
     cat "$TMP_LOG"
     echo "---------------------------"
+    show_rhui_failure_guidance
     exit 1
 fi
 
@@ -484,9 +655,12 @@ echo "Summary"
 
 line
 
-echo "Billing   : $BILLING_MODEL"
-echo "OS        : $PRETTY_NAME"
-echo "Image     : $IMAGE_SUFFIX"
-echo "Repo      : $REPO_NAME"
-echo "Package   : $(rpm -qa | grep -i rhui)"
+echo "OS                   : $PRETTY_NAME"
+echo "OS created from      : $OS_CREATED_FROM"
+echo "Image classification : $IMAGE_CLASSIFICATION"
+echo "Billing model        : $BILLING_MODEL"
+echo "Image type           : $IMAGE_SUFFIX"
+echo "Repo                 : $REPO_NAME"
+echo "Package              : $(rpm -qa | grep -i rhui)"
+
 line
