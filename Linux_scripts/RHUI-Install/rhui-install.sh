@@ -322,16 +322,16 @@ if [[ "$IMAGE_CLASSIFICATION" == "Custom image" ]]; then
         ok "Selected image type matches the installed workload packages"
     fi
 else
-    SKU_LOWER=$(echo "$SKU" | tr '[:upper:]' '[:lower:]')
+    OFFER_LOWER=$(echo "$OFFER" | tr '[:upper:]' '[:lower:]')
     IMAGE_SUFFIX="standard"
 
-    if echo "$SKU_LOWER" | grep -q "sapapps"; then
+    if echo "$OFFER_LOWER" | grep -q "sapapps"; then
         IMAGE_SUFFIX="sapapps"
-    elif echo "$SKU_LOWER" | grep -q "sap" && echo "$SKU_LOWER" | grep -q "ha"; then
+    elif echo "$OFFER_LOWER" | grep -q "sap" && echo "$OFFER_LOWER" | grep -q "ha"; then
         IMAGE_SUFFIX="sap-ha"
-    elif echo "$SKU_LOWER" | grep -q "sap"; then
+    elif echo "$OFFER_LOWER" | grep -q "sap"; then
         IMAGE_SUFFIX="sap"
-    elif echo "$SKU_LOWER" | grep -q "ha"; then
+    elif echo "$OFFER_LOWER" | grep -q "ha"; then
         IMAGE_SUFFIX="ha"
     fi
 
