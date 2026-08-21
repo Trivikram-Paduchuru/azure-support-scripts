@@ -327,6 +327,8 @@ else
 
     if echo "$OFFER_LOWER" | grep -q "sapapps"; then
         IMAGE_SUFFIX="sapapps"
+    elif echo "$OFFER_LOWER" | grep -q "sap-apps"; then
+        IMAGE_SUFFIX="sapapps"
     elif echo "$OFFER_LOWER" | grep -q "sap" && echo "$OFFER_LOWER" | grep -q "ha"; then
         IMAGE_SUFFIX="sap-ha"
     elif echo "$OFFER_LOWER" | grep -q "sap"; then
