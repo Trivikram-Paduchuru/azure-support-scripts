@@ -1,7 +1,7 @@
 # RHUI Installation Automation for Azure RHEL VMs
 
 > [!IMPORTANT]
-> This script is intended for **initial RHUI installation only**.
+> This script is intended for **RHUI installation only**.
 >
 > The script first checks whether an RHUI package is already installed on the virtual machine:
 >
